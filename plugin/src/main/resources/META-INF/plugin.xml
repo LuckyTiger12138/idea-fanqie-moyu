@@ -1,0 +1,97 @@
+<idea-plugin>
+    <id>com.tomato.worknotes</id>
+    <name>Work Notes</name>
+    <version>0.3.3</version>
+    <vendor>local</vendor>
+
+    <description><![CDATA[
+    <p>在编辑器内以代码注释形态浏览本地文本文件。</p>
+    <ul>
+        <li>书库为本地目录，不联网、不上传任何内容</li>
+        <li>三种显示形态：伪 Java 注释 / i18n 资源包 / 普通 markdown</li>
+        <li>一键收起，立即回到打开前的文件</li>
+        <li>快捷键均可在 Settings &gt; Keymap 中修改</li>
+    </ul>
+    ]]></description>
+
+    <idea-version since-build="213"/>
+
+    <depends>com.intellij.modules.platform</depends>
+
+    <extensions defaultExtensionNs="com.intellij">
+        <applicationService serviceImplementation="com.tomato.reader.ReaderSettings"/>
+        <projectService serviceImplementation="com.tomato.reader.ReaderService"/>
+        <applicationConfigurable
+                instance="com.tomato.reader.ui.SettingsConfigurable"
+                id="com.tomato.reader.settings"
+                displayName="Work Notes"/>
+        <toolWindow id="WorkNotes"
+                    anchor="right"
+                    factoryClass="com.tomato.reader.ui.LibraryWindow"/>
+    </extensions>
+
+    <actions>
+        <action id="WorkNotes.Library"
+                class="com.tomato.reader.action.OpenLibraryAction"
+                text="打开书库面板"
+                description="在右侧打开搜索与下载面板">
+            <keyboard-shortcut keymap="$default" first-keystroke="ctrl alt shift L"/>
+            <add-to-group group-id="ToolsMenu" anchor="first"/>
+        </action>
+
+        <action id="WorkNotes.Open"
+                class="com.tomato.reader.action.OpenAction"
+                text="打开笔记"
+                description="打开或继续上次阅读的位置">
+            <keyboard-shortcut keymap="$default" first-keystroke="ctrl alt shift X"/>
+            <add-to-group group-id="ToolsMenu" anchor="last"/>
+        </action>
+
+        <action id="WorkNotes.Choose"
+                class="com.tomato.reader.action.ChooseBookAction"
+                text="更换笔记文件"
+                description="重新选择书库里的文件">
+            <add-to-group group-id="ToolsMenu" anchor="after" relative-to-action="WorkNotes.Open"/>
+        </action>
+
+        <action id="WorkNotes.Search"
+                class="com.tomato.reader.action.SearchAction"
+                text="在线搜索书籍"
+                description="通过第三方接口搜索并打开一本书（需先在设置里填接口地址）">
+            <keyboard-shortcut keymap="$default" first-keystroke="ctrl alt shift D"/>
+            <add-to-group group-id="ToolsMenu" anchor="after" relative-to-action="WorkNotes.Choose"/>
+        </action>
+
+        <action id="WorkNotes.Next"
+                class="com.tomato.reader.action.NextAction"
+                text="下一节"
+                description="阅读下一节">
+            <keyboard-shortcut keymap="$default" first-keystroke="ctrl alt shift C"/>
+            <add-to-group group-id="ToolsMenu" anchor="after" relative-to-action="WorkNotes.Search"/>
+        </action>
+
+        <action id="WorkNotes.Prev"
+                class="com.tomato.reader.action.PrevAction"
+                text="上一节"
+                description="阅读上一节">
+            <keyboard-shortcut keymap="$default" first-keystroke="ctrl alt shift Z"/>
+            <add-to-group group-id="ToolsMenu" anchor="after" relative-to-action="WorkNotes.Next"/>
+        </action>
+
+        <action id="WorkNotes.Skin"
+                class="com.tomato.reader.action.SkinAction"
+                text="切换显示形态"
+                description="在注释 / 资源包 / markdown 之间轮换">
+            <keyboard-shortcut keymap="$default" first-keystroke="ctrl alt shift K"/>
+            <add-to-group group-id="ToolsMenu" anchor="after" relative-to-action="WorkNotes.Prev"/>
+        </action>
+
+        <action id="WorkNotes.Panic"
+                class="com.tomato.reader.action.PanicAction"
+                text="收起笔记"
+                description="立即关闭笔记标签并回到原来的文件">
+            <keyboard-shortcut keymap="$default" first-keystroke="ctrl alt shift Q"/>
+            <add-to-group group-id="ToolsMenu" anchor="after" relative-to-action="WorkNotes.Skin"/>
+        </action>
+    </actions>
+</idea-plugin>

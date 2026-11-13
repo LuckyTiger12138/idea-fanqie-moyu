@@ -1,0 +1,549 @@
+package com.tomato.reader;
+
+import com.intellij.openapi.application.ApplicationManager;
+import com.intellij.openapi.command.WriteCommandAction;
+import com.intellij.openapi.editor.Document;
+import com.intellij.openapi.editor.Editor;
+import com.intellij.openapi.fileEditor.FileDocumentManager;
+import com.intellij.openapi.fileEditor.FileEditorManager;
+import com.intellij.openapi.fileEditor.OpenFileDescriptor;
+import com.intellij.openapi.project.Project;
+import com.intellij.openapi.ui.Messages;
+import com.intellij.openapi.vfs.LocalFileSystem;
+import com.intellij.openapi.vfs.VirtualFile;
+import com.tomato.reader.api.ApiClient;
+import com.tomato.reader.source.BookSource;
+import com.tomato.reader.source.Entry;
+import com.tomato.reader.source.LocalSource;
+import com.tomato.reader.source.OnlineSource;
+import com.tomato.reader.ui.SearchDialog;
+import com.intellij.util.concurrency.AppExecutorUtil;
+import org.jetbrains.annotations.Nullable;
+
+import java.io.File;
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.stream.Stream;
+
+/**
+ * 阅读会话：选源、取正文、渲染、隐身。
+ * 本地源与在线源共用同一套渲染和翻节逻辑，差别只在 {@link BookSource} 的实现。
+ */
+public final class ReaderService {
+
+    private static final String TITLE = "Work Notes";
+    private static final String[] SKINS = {"COMMENT", "PROPS", "PLAIN"};
+    private static final String LOADING = "（正在取这一节……）";
+
+    private final Project project;
+
+    private BookSource source;
+    private List<Entry> entries = Collections.emptyList();
+    private int index;
+    private VirtualFile viewFile;
+    private String previousFile;
+
+    /** 正文内存缓存，LRU 12 节 */
+    private final Map<String, String> bodyCache = new LinkedHashMap<String, String>(16, 0.75f, true) {
+        @Override
+        protected boolean removeEldestEntry(Map.Entry<String, String> eldest) {
+            return size() > 12;
+        }
+    };
+
+    /** 请求令牌，切节时作废旧请求的回包 */
+    private int reqToken;
+
+    /** 进度变化回调（面板据此刷新「第 N / M 节」），由工具窗口注册 */
+    private volatile Runnable progressListener;
+
+    public ReaderService(Project project) {
+        this.project = project;
+    }
+
+    public static ReaderService getInstance(Project project) {
+        return project.getService(ReaderService.class);
+    }
+
+    public void setProgressListener(@Nullable Runnable listener) {
+        this.progressListener = listener;
+        notifyProgress();
+    }
+
+    private void notifyProgress() {
+        Runnable r = progressListener;
+        if (r == null) {
+            return;
+        }
+        if (ApplicationManager.getApplication().isDispatchThread()) {
+            r.run();
+        } else {
+            ApplicationManager.getApplication().invokeLater(r);
+        }
+    }
+
+    /** 当前是第几节（从 1 开始），未打开返回 0 */
+    public int currentPosition() {
+        return entries.isEmpty() ? 0 : index + 1;
+    }
+
+    public int sectionCount() {
+        return entries.size();
+    }
+
+    public String currentTitle() {
+        return entries.isEmpty() ? "" : entries.get(index).title;
+    }
+
+    /** 跳到指定节，参数从 1 开始；越界则夹到边界 */
+    public void jumpTo(int oneBased) {
+        if (entries.isEmpty()) {
+            open();
+            return;
+        }
+        int target = Math.max(1, Math.min(oneBased, entries.size())) - 1;
+        if (target == index) {
+            return;
+        }
+        index = target;
+        show(false);
+    }
+
+    public String statusText() {
+        if (entries.isEmpty()) {
+            return "未打开";
+        }
+        String name = entries.get(index).title;
+        return name + "  " + (index + 1) + "/" + entries.size();
+    }
+
+    // ------------------------------------------------------------------ 入口
+
+    /** 打开或继续上次的位置 */
+    public void open() {
+        ReaderSettings s = ReaderSettings.get();
+        if ("ONLINE".equals(s.mode)) {
+            ApiClient api = apiClient();
+            if (!api.isConfigured()) {
+                Messages.showInfoMessage(project,
+                        "当前是在线模式，但还没有填写 API 地址。\n\n"
+                                + "打开 Settings > Tools > Work Notes，填入第三方接口地址后重试；\n"
+                                + "或者把模式切回「本地文件」。", TITLE);
+                return;
+            }
+            if (s.onlineBookId == null || s.onlineBookId.trim().isEmpty()) {
+                searchOnline();
+                return;
+            }
+            openOnline(s.onlineBookId.trim(), s.onlineBookTitle);
+            return;
+        }
+        openLocal(s);
+    }
+
+    public void searchOnline() {
+        ApiClient api = apiClient();
+        if (!api.isConfigured()) {
+            Messages.showInfoMessage(project,
+                    "还没有填写 API 地址。\n\nSettings > Tools > Work Notes 里填入第三方接口地址后重试。", TITLE);
+            return;
+        }
+        SearchDialog dialog = new SearchDialog(project, api);
+        if (!dialog.showAndGet()) {
+            return;
+        }
+        String id = dialog.selectedId();
+        if (id != null && !id.isEmpty()) {
+            openOnline(id, dialog.selectedName());
+        }
+    }
+
+    // ------------------------------------------------------------------ 本地源
+
+    private void openLocal(ReaderSettings s) {
+        Path file = null;
+        if (s.bookFile != null && !s.bookFile.trim().isEmpty()) {
+            try {
+                Path p = Paths.get(s.bookFile.trim());
+                if (Files.isRegularFile(p)) {
+                    file = p;
+                }
+            } catch (Exception ignored) {
+                // 路径非法就当没有
+            }
+        }
+        if (file == null) {
+            file = askForFile(s);
+        }
+        if (file == null) {
+            return;
+        }
+        openPath(file, s);
+    }
+
+    /** 直接打开指定文件，供下载完成后自动跳转使用 */
+    public void openFile(Path file) {
+        if (file == null) {
+            return;
+        }
+        openPath(file, ReaderSettings.get());
+    }
+
+    private void openPath(Path file, ReaderSettings s) {
+        String text;
+        try {
+            text = new String(Files.readAllBytes(file), StandardCharsets.UTF_8);
+        } catch (IOException e) {
+            Messages.showErrorDialog(project, "读取文件失败：" + e.getMessage(), TITLE);
+            return;
+        }
+        List<Chapter> chapters = BookParser.parse(text);
+        if (chapters.isEmpty()) {
+            Messages.showInfoMessage(project, "这个文件里没有可读内容。", TITLE);
+            return;
+        }
+        String abs = file.toAbsolutePath().toString();
+        boolean sameBook = abs.equals(s.bookFile);
+        LocalSource local = new LocalSource(file, chapters);
+        source = local;
+        entries = local.entries();
+        index = sameBook ? Math.max(0, Math.min(s.chapterIndex, entries.size() - 1)) : 0;
+        s.bookFile = abs;
+        s.mode = "LOCAL";
+        s.chapterIndex = index;
+        bodyCache.clear();
+        show(true);
+    }
+
+    /** 强制重新选本地文件 */
+    public void chooseBook() {
+        Path file = askForFile(ReaderSettings.get());
+        if (file == null) {
+            return;
+        }
+        try {
+            String text = new String(Files.readAllBytes(file), StandardCharsets.UTF_8);
+            List<Chapter> chapters = BookParser.parse(text);
+            if (chapters.isEmpty()) {
+                Messages.showInfoMessage(project, "这个文件里没有可读内容。", TITLE);
+                return;
+            }
+            LocalSource local = new LocalSource(file, chapters);
+            source = local;
+            entries = local.entries();
+            index = 0;
+            ReaderSettings s = ReaderSettings.get();
+            s.bookFile = file.toAbsolutePath().toString();
+            s.mode = "LOCAL";
+            bodyCache.clear();
+            show(true);
+        } catch (IOException e) {
+            Messages.showErrorDialog(project, "读取文件失败：" + e.getMessage(), TITLE);
+        }
+    }
+
+    @Nullable
+    private Path askForFile(ReaderSettings s) {
+        Path dir = s.dir();
+        try {
+            Files.createDirectories(dir);
+        } catch (IOException e) {
+            Messages.showErrorDialog(project, "无法创建目录：" + dir, TITLE);
+            return null;
+        }
+        List<Path> books = listBooks(dir);
+        if (books.isEmpty()) {
+            int answer = Messages.showYesNoDialog(project,
+                    "目录是空的。\n\n把 .txt 文件放进这个目录后再试：\n" + dir
+                            + "\n\n是否现在打开这个目录？", TITLE, null);
+            if (answer == Messages.YES) {
+                try {
+                    java.awt.Desktop.getDesktop().open(dir.toFile());
+                } catch (Exception ignored) {
+                    // 桌面 API 不可用时静默忽略
+                }
+            }
+            return null;
+        }
+        if (books.size() == 1) {
+            return books.get(0);
+        }
+        String[] names = new String[books.size()];
+        for (int i = 0; i < books.size(); i++) {
+            names[i] = books.get(i).getFileName().toString();
+        }
+        int picked = Messages.showChooseDialog(project, "选择要打开的文件", TITLE, null, names, names[0]);
+        if (picked < 0 || picked >= books.size()) {
+            return null;
+        }
+        return books.get(picked);
+    }
+
+    private List<Path> listBooks(Path dir) {
+        List<Path> out = new ArrayList<>();
+        try (Stream<Path> stream = Files.list(dir)) {
+            stream.filter(Files::isRegularFile).filter(p -> {
+                String n = p.getFileName().toString().toLowerCase();
+                return n.endsWith(".txt") || n.endsWith(".md");
+            }).sorted().forEach(out::add);
+        } catch (IOException ignored) {
+            // 目录不可读，返回空
+        }
+        return out;
+    }
+
+    // ------------------------------------------------------------------ 在线源
+
+    private void openOnline(String bookId, String title) {
+        final ApiClient api = apiClient();
+        if (!api.isConfigured()) {
+            return;
+        }
+        final OnlineSource src = new OnlineSource(api, bookId, title);
+        AppExecutorUtil.getAppExecutorService().execute(() -> {
+            try {
+                final List<Entry> list = src.entries();
+                ApplicationManager.getApplication().invokeLater(() -> {
+                    if (project.isDisposed()) {
+                        return;
+                    }
+                    ReaderSettings s = ReaderSettings.get();
+                    boolean sameBook = bookId.equals(s.onlineBookId);
+                    source = src;
+                    entries = list;
+                    index = sameBook ? Math.max(0, Math.min(s.chapterIndex, entries.size() - 1)) : 0;
+                    s.onlineBookId = bookId;
+                    s.onlineBookTitle = title == null ? "" : title;
+                    s.mode = "ONLINE";
+                    bodyCache.clear();
+                    show(true);
+                });
+            } catch (final Exception ex) {
+                ApplicationManager.getApplication().invokeLater(() -> Messages.showErrorDialog(
+                        project, "打开失败：" + ex.getMessage(), TITLE));
+            }
+        });
+    }
+
+    private ApiClient apiClient() {
+        ReaderSettings s = ReaderSettings.get();
+        return new ApiClient(s.baseUrl, ApiClient.parseHeaders(s.extraHeaders, null, null), 15000);
+    }
+
+    // ------------------------------------------------------------------ 渲染
+
+    private void show(boolean first) {
+        if (entries.isEmpty() || source == null) {
+            return;
+        }
+        final Entry entry = entries.get(index);
+        String cached = bodyCache.get(entry.id);
+        if (cached != null) {
+            renderBody(entry, cached, first);
+            return;
+        }
+        // 本地源取正文是纯内存操作，直接同步拿
+        if (source instanceof LocalSource) {
+            try {
+                String body = source.body(entry);
+                bodyCache.put(entry.id, body);
+                renderBody(entry, body, first);
+            } catch (Exception e) {
+                renderBody(entry, "（读取失败：" + e.getMessage() + "）", first);
+            }
+            return;
+        }
+        // 在线源：先渲染占位，再后台取
+        renderBody(entry, LOADING, first);
+        final int my = ++reqToken;
+        final int reqIndex = index;
+        AppExecutorUtil.getAppExecutorService().execute(() -> {
+            String body = null;
+            String error = null;
+            try {
+                body = source.body(entry);
+            } catch (Exception e) {
+                error = e.getMessage() == null ? e.toString() : e.getMessage();
+            }
+            final String finalBody = body;
+            final String finalError = error;
+            ApplicationManager.getApplication().invokeLater(() -> {
+                if (project.isDisposed() || my != reqToken || reqIndex != index) {
+                    return;
+                }
+                if (finalBody != null) {
+                    bodyCache.put(entry.id, finalBody);
+                    renderBody(entry, finalBody, false);
+                    prefetchNext();
+                } else {
+                    renderBody(entry, "（取正文失败：" + finalError + "）", false);
+                }
+            });
+        });
+    }
+
+    /** 后台预取下一节，让翻页没有等待 */
+    private void prefetchNext() {
+        if (source instanceof LocalSource || index + 1 >= entries.size()) {
+            return;
+        }
+        final Entry next = entries.get(index + 1);
+        if (bodyCache.containsKey(next.id)) {
+            return;
+        }
+        AppExecutorUtil.getAppExecutorService().execute(() -> {
+            try {
+                final String body = source.body(next);
+                ApplicationManager.getApplication().invokeLater(() -> {
+                    if (!project.isDisposed() && body != null && !body.trim().isEmpty()) {
+                        bodyCache.put(next.id, body);
+                    }
+                });
+            } catch (Exception ignored) {
+                // 预取失败不影响当前阅读
+            }
+        });
+    }
+
+    private void renderBody(Entry entry, String body, boolean first) {
+        ReaderSettings s = ReaderSettings.get();
+        String content = BookParser.render(new Chapter(entry.title, body), s.skin, s.width, index, entries.size());
+
+        Path dir = s.viewDir();
+        final String path = dir.resolve(BookParser.fileNameFor(s.skin)).toString().replace('\\', '/');
+        File target = new File(path);
+
+        FileEditorManager fem = FileEditorManager.getInstance(project);
+        if (first) {
+            VirtualFile[] selected = fem.getSelectedFiles();
+            if (selected.length > 0 && selected[0].isValid() && !selected[0].getPath().equals(path)) {
+                previousFile = selected[0].getPath();
+            }
+        }
+
+        // 视图文件一旦被 IDE 打开，就只能通过 Document 改内容，绝不能直接写磁盘：
+        // 先 Files.write 再 doc.setText 会让 IDE 认为「磁盘被外部改动、内存里还有未保存内容」，
+        // 于是每翻一节都弹一次「文件缓存冲突」。
+        VirtualFile vf;
+        if (viewFile != null && viewFile.isValid() && path.equals(viewFile.getPath())) {
+            vf = viewFile;
+        } else {
+            vf = LocalFileSystem.getInstance().findFileByIoFile(target);
+        }
+
+        Document doc = vf == null ? null : FileDocumentManager.getInstance().getDocument(vf);
+        if (doc != null) {
+            final Document d = doc;
+            final String text = content;
+            WriteCommandAction.runWriteCommandAction(project, () -> {
+                d.setText(text);
+                FileDocumentManager.getInstance().saveDocument(d);
+            });
+        } else {
+            // 还没被加载：直接落盘不会产生冲突，写完再登记到 VFS
+            try {
+                Files.createDirectories(dir);
+                Files.write(target.toPath(), content.getBytes(StandardCharsets.UTF_8));
+            } catch (IOException e) {
+                Messages.showErrorDialog(project, "写入视图文件失败：" + e.getMessage(), TITLE);
+                return;
+            }
+            vf = LocalFileSystem.getInstance().refreshAndFindFileByIoFile(target);
+            if (vf == null) {
+                Messages.showErrorDialog(project, "无法创建视图文件：" + target, TITLE);
+                return;
+            }
+        }
+        viewFile = vf;
+
+        fem.openTextEditor(new OpenFileDescriptor(project, vf, 0), true);
+        s.chapterIndex = index;
+        notifyProgress();
+    }
+
+    // ------------------------------------------------------------------ 翻节
+
+    public void next() {
+        move(1);
+    }
+
+    public void previous() {
+        move(-1);
+    }
+
+    private void move(int delta) {
+        if (entries.isEmpty()) {
+            open();
+            return;
+        }
+        int target = index + delta;
+        if (target < 0) {
+            Messages.showInfoMessage(project, "已经是第一节了。", TITLE);
+            return;
+        }
+        if (target >= entries.size()) {
+            Messages.showInfoMessage(project, "已经是最后一节了。", TITLE);
+            return;
+        }
+        index = target;
+        show(false);
+    }
+
+    // ------------------------------------------------------------------ 隐身
+
+    public void panic() {
+        FileEditorManager fem = FileEditorManager.getInstance(project);
+        if (viewFile != null && viewFile.isValid()) {
+            fem.closeFile(viewFile);
+        } else {
+            Path dir = ReaderSettings.get().viewDir();
+            for (String skin : SKINS) {
+                VirtualFile vf = LocalFileSystem.getInstance().findFileByPath(
+                        dir.resolve(BookParser.fileNameFor(skin)).toString().replace('\\', '/'));
+                if (vf != null) {
+                    fem.closeFile(vf);
+                }
+            }
+        }
+        if (previousFile != null) {
+            VirtualFile prev = LocalFileSystem.getInstance().findFileByPath(previousFile);
+            if (prev != null && prev.isValid()) {
+                fem.openFile(prev, true);
+            }
+        }
+        Editor editor = fem.getSelectedTextEditor();
+        if (editor != null) {
+            editor.getContentComponent().requestFocusInWindow();
+        }
+    }
+
+    // ------------------------------------------------------------------ 形态
+
+    public void cycleSkin() {
+        ReaderSettings s = ReaderSettings.get();
+        int at = 0;
+        for (int i = 0; i < SKINS.length; i++) {
+            if (SKINS[i].equals(s.skin)) {
+                at = i;
+            }
+        }
+        s.skin = SKINS[(at + 1) % SKINS.length];
+        if (viewFile != null && viewFile.isValid()) {
+            FileEditorManager.getInstance(project).closeFile(viewFile);
+            viewFile = null;
+        }
+        if (!entries.isEmpty()) {
+            String cached = bodyCache.get(entries.get(index).id);
+            renderBody(entries.get(index), cached == null ? LOADING : cached, false);
+        }
+        Messages.showInfoMessage(project, "当前形态：" + s.skin, TITLE);
+    }
+}
