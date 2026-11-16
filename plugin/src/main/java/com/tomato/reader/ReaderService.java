@@ -95,12 +95,17 @@ public final class ReaderService implements Disposable {
     private volatile boolean autoPending;
     private int holdTicks;
 
-    /** 手动滚到末尾自动接下一节：滚轮监听挂在阅读视图的编辑区上 */
+    /**
+     * 手动滚到末尾自动接下一节。
+     * 只能挂在外层 JScrollPane 上（它自身的滚动处理器也在同一个组件上，两份监听都能收到）；
+     * 绝对不能挂 editor.getContentComponent()：Swing 只把滚轮事件投给「最深的、注册了滚轮监听的组件」，
+     * 内容组件一旦有监听，外层滚动面板就永远收不到事件，滚轮直接失效，只剩拖滚动条能滚。
+     */
     private final MouseWheelListener wheelListener = this::onWheel;
     private final List<Component> wheelTargets = new ArrayList<>();
     private Component wheelTarget;
     private long lastChainAt;
-    /** 全局 AWT 滚轮监听：编辑区可能把滚轮事件自己消化掉，这里兜一层保险 */
+    /** AWT 层再兜一道：只观察、不参与分发，不影响编辑区自己的滚动 */
     private final AWTEventListener awtWheel = this::onAwtWheel;
     private boolean awtWheelInstalled;
 
@@ -775,23 +780,29 @@ public final class ReaderService implements Disposable {
     // ------------------------------------------------------------ 滚到底自动接下一节
 
     /**
-     * 把滚轮监听挂到阅读视图上：编辑区和外层滚动面板各挂一份，
-     * 编辑区自己吃掉滚轮事件时外层那份还能收到，避免「滚了没反应」。
+     * 把滚轮监听挂到阅读视图外层的滚动面板上。
+     * 滚动面板自身的滚动处理器也挂在这个组件上，加一份监听不会抢事件；
+     * 而挂到内容组件上会让滚轮彻底失效——这就是 0.3.5/0.3.6「滚不动」的真正原因。
      */
     private void installScrollHook() {
         if (!ReaderSettings.get().chainOnScroll) {
             return;
         }
-        Editor editor = FileEditorManager.getInstance(project).getSelectedTextEditor();
+        Editor editor = selectedReaderEditor();
         if (editor == null) {
             return;
         }
-        VirtualFile shown = FileDocumentManager.getInstance().getFile(editor.getDocument());
-        if (shown == null || viewFile == null || !shown.getPath().equals(viewFile.getPath())) {
+        Component content = editor.getContentComponent();
+        if (content == null) {
             return;
         }
-        Component c = editor.getContentComponent();
-        if (c == wheelTarget) {
+        // 顺手清掉旧版本残留在内容组件上的监听（就是它把滚轮事件吃掉了）
+        content.removeMouseWheelListener(wheelListener);
+        JScrollPane pane = (JScrollPane) SwingUtilities.getAncestorOfClass(JScrollPane.class, content);
+        if (pane == null) {
+            return;
+        }
+        if (pane == wheelTarget) {
             return;
         }
         for (Component old : wheelTargets) {
@@ -800,14 +811,9 @@ public final class ReaderService implements Disposable {
             }
         }
         wheelTargets.clear();
-        c.addMouseWheelListener(wheelListener);
-        wheelTargets.add(c);
-        Component pane = SwingUtilities.getAncestorOfClass(JScrollPane.class, c);
-        if (pane != null) {
-            pane.addMouseWheelListener(wheelListener);
-            wheelTargets.add(pane);
-        }
-        wheelTarget = c;
+        pane.addMouseWheelListener(wheelListener);
+        wheelTargets.add(pane);
+        wheelTarget = pane;
     }
 
     /** 全局滚轮监听在服务创建时就装好，避免编辑器换过一次才生效 */
@@ -842,7 +848,7 @@ public final class ReaderService implements Disposable {
      */
     private boolean atEnd(Editor editor) {
         Rectangle vis = editor.getScrollingModel().getVisibleArea();
-        if (vis == null) {
+        if (vis == null || vis.height <= 0) {
             return false;
         }
         int len = editor.getDocument().getTextLength();
@@ -852,7 +858,7 @@ public final class ReaderService implements Disposable {
     }
 
     /**
-     * 手动滚到底再往下滚 → 接下一节。
+     * 滚动面板上的滚轮事件：滚到底再往下滚 → 接下一节。
      * 只在「最后一行已经在屏幕上、还继续往下滚」时触发，读最后一屏不会被打断；
      * 触摸板/平滑滚动会给精确值而 getWheelRotation() 为 0，所以两个都看。
      */
@@ -860,7 +866,7 @@ public final class ReaderService implements Disposable {
         chainIfAtEnd(e);
     }
 
-    /** 全局兜底：编辑区把滚轮事件消化掉时，AWT 这一层还能看到 */
+    /** AWT 层兜底：纯观察，不影响事件分发与编辑区滚动 */
     private void onAwtWheel(AWTEvent event) {
         if (!(event instanceof MouseWheelEvent)) {
             return;
@@ -916,9 +922,12 @@ public final class ReaderService implements Disposable {
             return;
         }
         lastChainAt = now;
-        if (advanceChapter()) {
-            hint("WorkNotes · " + (index + 1) + "/" + entries.size());
-        }
+        // 不在事件分发过程中改文件，延到下一轮 EDT
+        ApplicationManager.getApplication().invokeLater(() -> {
+            if (advanceChapter()) {
+                hint("WorkNotes · " + (index + 1) + "/" + entries.size());
+            }
+        });
     }
 
     /** 换节后回到顶部，接着往下读 */
