@@ -95,7 +95,7 @@ public class SettingsConfigurable implements Configurable {
         body.add(row("显示形态", skinBox, "COMMENT=伪代码注释，PROPS=i18n 资源包，PLAIN=markdown"));
         body.add(row("每行宽度", widthField, "中文按 2 计，40 约等于 20 个汉字"));
 
-        body.add(row("自动间隔(ms)", autoMsField, "自动阅读时每行停留多久，1400 约等于一秒半滚一行"));
+        body.add(row("自动间隔(ms)", autoMsField, "自动阅读时每行停留多久，1200 约等于一秒二滚一行"));
         body.add(row("每次行数", autoLinesField, "每次向下滚几行，建议 1 到 3"));
         body.add(hint("自动阅读用 Ctrl+Alt+Shift+A 开关（也可用面板底部的「自动」勾选框）。"
                 + "开启后编辑器自己往下滚，读完一节自动接下一节，不需要点任何按钮；"
@@ -192,7 +192,7 @@ public class SettingsConfigurable implements Configurable {
         if (widthField != null && parseInt(widthField.getText(), 40) != s.width) {
             return true;
         }
-        if (autoMsField != null && parseInt(autoMsField.getText(), 1400) != s.autoIntervalMs) {
+        if (autoMsField != null && parseInt(autoMsField.getText(), 1200) != s.autoIntervalMs) {
             return true;
         }
         return autoLinesField != null && parseInt(autoLinesField.getText(), 1) != s.autoLines;
@@ -226,7 +226,7 @@ public class SettingsConfigurable implements Configurable {
             s.width = Math.max(20, Math.min(80, parseInt(widthField.getText(), 40)));
         }
         if (autoMsField != null) {
-            s.autoIntervalMs = Math.max(200, Math.min(60000, parseInt(autoMsField.getText(), 1400)));
+            s.autoIntervalMs = Math.max(200, Math.min(60000, parseInt(autoMsField.getText(), 1200)));
         }
         if (autoLinesField != null) {
             s.autoLines = Math.max(1, Math.min(20, parseInt(autoLinesField.getText(), 1)));

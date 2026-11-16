@@ -48,7 +48,7 @@ public class ReaderSettings implements PersistentStateComponent<ReaderSettings> 
     public String onlineBookTitle = "";
 
     /** 自动阅读：每次下滚的间隔毫秒（越小越快） */
-    public int autoIntervalMs = 1400;
+    public int autoIntervalMs = 1200;
 
     /** 自动阅读：每次下滚几行 */
     public int autoLines = 1;
