@@ -25,7 +25,10 @@ import com.intellij.util.Alarm;
 import com.intellij.util.concurrency.AppExecutorUtil;
 import org.jetbrains.annotations.Nullable;
 
+import java.awt.Component;
 import java.awt.Rectangle;
+import java.awt.event.MouseWheelEvent;
+import java.awt.event.MouseWheelListener;
 
 import java.io.File;
 import java.io.IOException;
@@ -83,6 +86,11 @@ public final class ReaderService implements Disposable {
     /** 开自动时若目录还没加载完，就等第一节内容渲染出来再真正启动 */
     private volatile boolean autoPending;
     private int holdTicks;
+
+    /** 手动滚到末尾自动接下一节：滚轮监听挂在阅读视图的编辑区上 */
+    private final MouseWheelListener wheelListener = this::onWheel;
+    private Component wheelTarget;
+    private long lastChainAt;
 
     public ReaderService(Project project) {
         this.project = project;
@@ -518,6 +526,7 @@ public final class ReaderService implements Disposable {
         // 自动阅读时不抢焦点：换节只是文件内容变了，光标留在别处也不会被打断
         fem.openTextEditor(new OpenFileDescriptor(project, vf, 0), !autoRead);
         s.chapterIndex = index;
+        installScrollHook();
         notifyProgress();
     }
 
@@ -698,12 +707,10 @@ public final class ReaderService implements Disposable {
                 return;
             }
             holdTicks = 0;
-            if (!stepNextQuiet()) {
+            if (!advanceChapter()) {
                 stopAuto();
                 hint("WorkNotes · end of book");
-                return;
             }
-            ApplicationManager.getApplication().invokeLater(this::scrollViewToTop);
         } else {
             holdTicks = 0;
             sm.scrollVertically(Math.min(bottom, cur + step));
@@ -719,6 +726,76 @@ public final class ReaderService implements Disposable {
         holdTicks = 0;
         show(false);
         return true;
+    }
+
+    /** 换到下一节并回到顶部；已经是最后一节返回 false，不弹窗 */
+    private boolean advanceChapter() {
+        if (!stepNextQuiet()) {
+            return false;
+        }
+        ApplicationManager.getApplication().invokeLater(this::scrollViewToTop);
+        return true;
+    }
+
+    // ------------------------------------------------------------ 滚到底自动接下一节
+
+    /** 把滚轮监听挂到阅读视图的编辑区上，只挂一次 */
+    private void installScrollHook() {
+        if (!ReaderSettings.get().chainOnScroll) {
+            return;
+        }
+        Editor editor = FileEditorManager.getInstance(project).getSelectedTextEditor();
+        if (editor == null) {
+            return;
+        }
+        VirtualFile shown = FileDocumentManager.getInstance().getFile(editor.getDocument());
+        if (shown == null || viewFile == null || !shown.getPath().equals(viewFile.getPath())) {
+            return;
+        }
+        Component c = editor.getContentComponent();
+        if (c == wheelTarget) {
+            return;
+        }
+        if (wheelTarget != null) {
+            wheelTarget.removeMouseWheelListener(wheelListener);
+        }
+        c.addMouseWheelListener(wheelListener);
+        wheelTarget = c;
+    }
+
+    /**
+     * 手动滚到底再往下滚一格 → 接下一节。
+     * 只在「已经贴到底、还继续往下滚」时触发，读最后一屏时不会被打断；
+     * 短到一屏放得下的节，滚一下就换，一次滚轮只换一节。
+     */
+    private void onWheel(MouseWheelEvent e) {
+        if (e == null || e.getWheelRotation() <= 0 || !ReaderSettings.get().chainOnScroll) {
+            return;
+        }
+        if (entries.isEmpty() || viewFile == null || !bodyReady) {
+            return;
+        }
+        Editor editor = FileEditorManager.getInstance(project).getSelectedTextEditor();
+        if (editor == null) {
+            return;
+        }
+        VirtualFile shown = FileDocumentManager.getInstance().getFile(editor.getDocument());
+        if (shown == null || !shown.getPath().equals(viewFile.getPath())) {
+            return;
+        }
+        ScrollingModel sm = editor.getScrollingModel();
+        Rectangle vis = sm.getVisibleArea();
+        int contentHeight = editor.getContentComponent().getHeight();
+        int bottom = Math.max(0, contentHeight - (vis == null ? 0 : vis.height));
+        if (sm.getVerticalScrollOffset() < bottom - 1) {
+            return;
+        }
+        long now = System.currentTimeMillis();
+        if (now - lastChainAt < 600) {
+            return;
+        }
+        lastChainAt = now;
+        advanceChapter();
     }
 
     /** 换节后回到顶部，接着往下读 */

@@ -15,6 +15,7 @@ import org.jetbrains.annotations.Nullable;
 import javax.swing.BorderFactory;
 import javax.swing.BoxLayout;
 import javax.swing.JButton;
+import javax.swing.JCheckBox;
 import javax.swing.JComboBox;
 import javax.swing.JComponent;
 import javax.swing.JLabel;
@@ -41,6 +42,7 @@ public class SettingsConfigurable implements Configurable {
     private JTextField widthField;
     private JTextField autoMsField;
     private JTextField autoLinesField;
+    private JCheckBox chainBox;
     private JButton testBtn;
     private JPanel panel;
 
@@ -64,6 +66,7 @@ public class SettingsConfigurable implements Configurable {
         autoMsField.setPreferredSize(new Dimension(80, autoMsField.getPreferredSize().height));
         autoLinesField = new JTextField();
         autoLinesField.setPreferredSize(new Dimension(80, autoLinesField.getPreferredSize().height));
+        chainBox = new JCheckBox("滚到本节末尾后自动接下一节");
         testBtn = new JButton("测试连接");
         testBtn.addActionListener(e -> testConnection());
 
@@ -97,6 +100,7 @@ public class SettingsConfigurable implements Configurable {
 
         body.add(row("自动间隔(ms)", autoMsField, "自动阅读时每行停留多久，1200 约等于一秒二滚一行"));
         body.add(row("每次行数", autoLinesField, "每次向下滚几行，建议 1 到 3"));
+        body.add(row("滚到底接续", chainBox, "手动用滚轮翻到本节最后一行后，再往下滚一格就自动进入下一节"));
         body.add(hint("自动阅读用 Ctrl+Alt+Shift+A 开关（也可用面板底部的「自动」勾选框）。"
                 + "开启后编辑器自己往下滚，读完一节自动接下一节，不需要点任何按钮；"
                 + "当前台标签不是笔记文件时它会自动停住，不会滚动你正在看的其他代码。"));
@@ -195,6 +199,9 @@ public class SettingsConfigurable implements Configurable {
         if (autoMsField != null && parseInt(autoMsField.getText(), 1200) != s.autoIntervalMs) {
             return true;
         }
+        if (chainBox != null && chainBox.isSelected() != s.chainOnScroll) {
+            return true;
+        }
         return autoLinesField != null && parseInt(autoLinesField.getText(), 1) != s.autoLines;
     }
 
@@ -231,6 +238,9 @@ public class SettingsConfigurable implements Configurable {
         if (autoLinesField != null) {
             s.autoLines = Math.max(1, Math.min(20, parseInt(autoLinesField.getText(), 1)));
         }
+        if (chainBox != null) {
+            s.chainOnScroll = chainBox.isSelected();
+        }
     }
 
     @Override
@@ -260,6 +270,9 @@ public class SettingsConfigurable implements Configurable {
         if (autoLinesField != null) {
             autoLinesField.setText(String.valueOf(s.autoLines));
         }
+        if (chainBox != null) {
+            chainBox.setSelected(s.chainOnScroll);
+        }
     }
 
     @Override
@@ -273,6 +286,7 @@ public class SettingsConfigurable implements Configurable {
         widthField = null;
         autoMsField = null;
         autoLinesField = null;
+        chainBox = null;
         testBtn = null;
     }
 

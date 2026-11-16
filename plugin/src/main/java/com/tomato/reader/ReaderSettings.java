@@ -53,6 +53,9 @@ public class ReaderSettings implements PersistentStateComponent<ReaderSettings> 
     /** 自动阅读：每次下滚几行 */
     public int autoLines = 1;
 
+    /** 手动滚到本节末尾时，是否自动接下一节 */
+    public boolean chainOnScroll = true;
+
     public static ReaderSettings get() {
         return ApplicationManager.getApplication().getService(ReaderSettings.class);
     }

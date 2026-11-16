@@ -33,8 +33,8 @@ cp -r src/main/resources/. "$OUT/classes/"
 
 # 输出 .jar 而不是 .zip：IDEA 2026.x 对 .zip 走解压式加载会失败，
 # 对 .jar 直接读 zip 条目，才能正确解析 META-INF/plugin.xml。
-PKG="$OUT/WorkNotes-0.3.4.jar"
-( cd "$OUT/classes" && jar --create --file "../WorkNotes-0.3.4.jar" . )
+PKG="$OUT/WorkNotes-0.3.5.jar"
+( cd "$OUT/classes" && jar --create --file "../WorkNotes-0.3.5.jar" . )
 
 echo "构建完成：$(pwd)/$PKG"
 ls -la "$PKG"
