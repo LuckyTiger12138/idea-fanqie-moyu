@@ -1,7 +1,7 @@
 <idea-plugin>
     <id>com.tomato.worknotes</id>
     <name>Work Notes</name>
-    <version>0.3.3</version>
+    <version>0.3.4</version>
     <vendor>local</vendor>
 
     <description><![CDATA[
@@ -76,6 +76,14 @@
                 description="阅读上一节">
             <keyboard-shortcut keymap="$default" first-keystroke="ctrl alt shift Z"/>
             <add-to-group group-id="ToolsMenu" anchor="after" relative-to-action="WorkNotes.Next"/>
+        </action>
+
+        <action id="WorkNotes.Auto"
+                class="com.tomato.reader.action.AutoAction"
+                text="自动阅读（开/关）"
+                description="编辑器自动向下滚动，读完一节自动接下一节，全程不需要点击">
+            <keyboard-shortcut keymap="$default" first-keystroke="ctrl alt shift A"/>
+            <add-to-group group-id="ToolsMenu" anchor="after" relative-to-action="WorkNotes.Prev"/>
         </action>
 
         <action id="WorkNotes.Skin"

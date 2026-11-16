@@ -1,9 +1,11 @@
 package com.tomato.reader;
 
+import com.intellij.openapi.Disposable;
 import com.intellij.openapi.application.ApplicationManager;
 import com.intellij.openapi.command.WriteCommandAction;
 import com.intellij.openapi.editor.Document;
 import com.intellij.openapi.editor.Editor;
+import com.intellij.openapi.editor.ScrollingModel;
 import com.intellij.openapi.fileEditor.FileDocumentManager;
 import com.intellij.openapi.fileEditor.FileEditorManager;
 import com.intellij.openapi.fileEditor.OpenFileDescriptor;
@@ -11,14 +13,19 @@ import com.intellij.openapi.project.Project;
 import com.intellij.openapi.ui.Messages;
 import com.intellij.openapi.vfs.LocalFileSystem;
 import com.intellij.openapi.vfs.VirtualFile;
+import com.intellij.openapi.wm.StatusBar;
+import com.intellij.openapi.wm.WindowManager;
 import com.tomato.reader.api.ApiClient;
 import com.tomato.reader.source.BookSource;
 import com.tomato.reader.source.Entry;
 import com.tomato.reader.source.LocalSource;
 import com.tomato.reader.source.OnlineSource;
 import com.tomato.reader.ui.SearchDialog;
+import com.intellij.util.Alarm;
 import com.intellij.util.concurrency.AppExecutorUtil;
 import org.jetbrains.annotations.Nullable;
+
+import java.awt.Rectangle;
 
 import java.io.File;
 import java.io.IOException;
@@ -37,7 +44,7 @@ import java.util.stream.Stream;
  * 阅读会话：选源、取正文、渲染、隐身。
  * 本地源与在线源共用同一套渲染和翻节逻辑，差别只在 {@link BookSource} 的实现。
  */
-public final class ReaderService {
+public final class ReaderService implements Disposable {
 
     private static final String TITLE = "Work Notes";
     private static final String[] SKINS = {"COMMENT", "PROPS", "PLAIN"};
@@ -65,8 +72,32 @@ public final class ReaderService {
     /** 进度变化回调（面板据此刷新「第 N / M 节」），由工具窗口注册 */
     private volatile Runnable progressListener;
 
+    /** 自动阅读开关变化回调，由工具窗口注册 */
+    private volatile Runnable autoListener;
+
+    /** 自动阅读：定时器、当前节正文是否已经就绪、最后一屏已停留的 tick 数 */
+    private final Alarm autoAlarm;
+    private volatile boolean autoRead;
+    private volatile boolean bodyReady;
+    private volatile boolean bodyFailed;
+    /** 开自动时若目录还没加载完，就等第一节内容渲染出来再真正启动 */
+    private volatile boolean autoPending;
+    private int holdTicks;
+
     public ReaderService(Project project) {
         this.project = project;
+        this.autoAlarm = new Alarm(Alarm.ThreadToUse.SWING_THREAD, this);
+    }
+
+    @Override
+    public void dispose() {
+        autoRead = false;
+        try {
+            autoAlarm.cancelAllRequests();
+            autoAlarm.dispose();
+        } catch (Throwable ignored) {
+            // 平台已释放时忽略
+        }
     }
 
     public static ReaderService getInstance(Project project) {
@@ -415,6 +446,26 @@ public final class ReaderService {
 
     private void renderBody(Entry entry, String body, boolean first) {
         ReaderSettings s = ReaderSettings.get();
+        // 自动阅读靠这个判断「这一节的正文是不是真的到了」
+        if (LOADING.equals(body)) {
+            bodyReady = false;
+            bodyFailed = false;
+        } else if (body != null && (body.startsWith("（取正文失败") || body.startsWith("（读取失败"))) {
+            bodyReady = true;
+            bodyFailed = true;
+        } else {
+            bodyReady = true;
+            bodyFailed = false;
+        }
+        holdTicks = 0;
+        if (autoPending) {
+            autoPending = false;
+            if (!autoRead) {
+                autoRead = true;
+                notifyAuto();
+                scheduleNext();
+            }
+        }
         String content = BookParser.render(new Chapter(entry.title, body), s.skin, s.width, index, entries.size());
 
         Path dir = s.viewDir();
@@ -464,7 +515,8 @@ public final class ReaderService {
         }
         viewFile = vf;
 
-        fem.openTextEditor(new OpenFileDescriptor(project, vf, 0), true);
+        // 自动阅读时不抢焦点：换节只是文件内容变了，光标留在别处也不会被打断
+        fem.openTextEditor(new OpenFileDescriptor(project, vf, 0), !autoRead);
         s.chapterIndex = index;
         notifyProgress();
     }
@@ -497,9 +549,211 @@ public final class ReaderService {
         show(false);
     }
 
+    // ------------------------------------------------------------------ 自动阅读
+
+    /** 自动阅读是否在跑 */
+    public boolean isAutoReading() {
+        return autoRead;
+    }
+
+    public void setAutoListener(@Nullable Runnable listener) {
+        this.autoListener = listener;
+        notifyAuto();
+    }
+
+    private void notifyAuto() {
+        Runnable r = autoListener;
+        if (r == null) {
+            return;
+        }
+        if (ApplicationManager.getApplication().isDispatchThread()) {
+            r.run();
+        } else {
+            ApplicationManager.getApplication().invokeLater(r);
+        }
+    }
+
+    /** 一个键开关：不用点面板按钮 */
+    public void toggleAuto() {
+        if (autoRead) {
+            stopAuto();
+            hint("WorkNotes · auto-scroll off");
+        } else {
+            startAuto();
+        }
+    }
+
+    /**
+     * 开始自动阅读：每隔一小段时间把编辑器往下滚几行，滚到这一节末尾自动接下一节，
+     * 全程不需要任何点击。
+     */
+    public void startAuto() {
+        if (entries.isEmpty()) {
+            open();
+        }
+        if (entries.isEmpty()) {
+            // 目录还在后台取，等第一节渲染出来再自动开始
+            autoPending = true;
+            hint("WorkNotes · waiting for content");
+            return;
+        }
+        if (autoRead) {
+            return;
+        }
+        autoRead = true;
+        holdTicks = 0;
+        hint(autoHint());
+        notifyAuto();
+        scheduleNext();
+    }
+
+    public void stopAuto() {
+        boolean was = autoRead;
+        autoRead = false;
+        autoPending = false;
+        holdTicks = 0;
+        try {
+            autoAlarm.cancelAllRequests();
+        } catch (Throwable ignored) {
+            // 已释放
+        }
+        if (was) {
+            notifyAuto();
+        }
+    }
+
+    private String autoHint() {
+        ReaderSettings s = ReaderSettings.get();
+        int ms = Math.max(100, s.autoIntervalMs);
+        return "WorkNotes · auto-scroll " + String.format("%.1f", ms / 1000.0) + "s/line";
+    }
+
+    private void scheduleNext() {
+        int base = Math.max(100, ReaderSettings.get().autoIntervalMs);
+        // 轻微抖动，节奏不机械
+        int delay = base + (int) (Math.random() * (base * 0.15));
+        try {
+            autoAlarm.addRequest(this::tick, delay);
+        } catch (Throwable t) {
+            stopAuto();
+        }
+    }
+
+    private void tick() {
+        if (!autoRead || project.isDisposed()) {
+            return;
+        }
+        try {
+            autoStep();
+        } catch (Throwable ignored) {
+            // 单次滚动失败不终止整个流程
+        }
+        if (autoRead) {
+            scheduleNext();
+        }
+    }
+
+    /** 一次滚动：读满一屏就往下挪，挪到底自动换下一节 */
+    private void autoStep() {
+        if (viewFile == null || !viewFile.isValid()) {
+            stopAuto();
+            return;
+        }
+        if (bodyFailed) {
+            stopAuto();
+            hint("WorkNotes · auto-scroll off (fetch failed)");
+            return;
+        }
+        if (!bodyReady) {
+            // 正文还在路上，等它回来再动
+            return;
+        }
+
+        FileEditorManager fem = FileEditorManager.getInstance(project);
+        Editor editor = fem.getSelectedTextEditor();
+        if (editor == null) {
+            return;
+        }
+        // 前台不是阅读文件时一律不动：绝不滚动别人的代码
+        VirtualFile shown = FileDocumentManager.getInstance().getFile(editor.getDocument());
+        if (shown == null || !shown.getPath().equals(viewFile.getPath())) {
+            return;
+        }
+
+        ReaderSettings s = ReaderSettings.get();
+        ScrollingModel sm = editor.getScrollingModel();
+        Rectangle vis = sm.getVisibleArea();
+        int lineH = Math.max(1, editor.getLineHeight());
+        int step = Math.max(1, s.autoLines) * lineH;
+        int contentHeight = editor.getContentComponent().getHeight();
+        int bottom = Math.max(0, contentHeight - (vis == null ? 0 : vis.height));
+        int cur = sm.getVerticalScrollOffset();
+
+        if (cur >= bottom - 2) {
+            // 到末尾了：先把最后一屏读完，再换下一节
+            int lines = editor.getDocument().getLineCount();
+            int visible = vis == null ? 20 : Math.max(1, vis.height / lineH);
+            int hold = Math.max(2, Math.min(visible, lines));
+            if (++holdTicks < hold) {
+                return;
+            }
+            holdTicks = 0;
+            if (!stepNextQuiet()) {
+                stopAuto();
+                hint("WorkNotes · end of book");
+                return;
+            }
+            ApplicationManager.getApplication().invokeLater(this::scrollViewToTop);
+        } else {
+            holdTicks = 0;
+            sm.scrollVertically(Math.min(bottom, cur + step));
+        }
+    }
+
+    /** 自动推进到下一节；已经是最后一节返回 false。全程不弹窗 */
+    private boolean stepNextQuiet() {
+        if (entries.isEmpty() || index + 1 >= entries.size()) {
+            return false;
+        }
+        index++;
+        holdTicks = 0;
+        show(false);
+        return true;
+    }
+
+    /** 换节后回到顶部，接着往下读 */
+    private void scrollViewToTop() {
+        Editor editor = FileEditorManager.getInstance(project).getSelectedTextEditor();
+        if (editor == null || viewFile == null) {
+            return;
+        }
+        VirtualFile shown = FileDocumentManager.getInstance().getFile(editor.getDocument());
+        if (shown != null && shown.getPath().equals(viewFile.getPath())) {
+            editor.getScrollingModel().scrollVertically(0);
+        }
+    }
+
+    /** 状态栏一行轻提示，不弹窗 */
+    private void hint(String text) {
+        try {
+            StatusBar bar = WindowManager.getInstance().getStatusBar(project);
+            if (bar == null) {
+                return;
+            }
+            try {
+                StatusBar.class.getMethod("setInfo", String.class).invoke(bar, text);
+            } catch (Throwable ignored) {
+                // 新平台若移除了 setInfo(String)，静默跳过
+            }
+        } catch (Throwable ignored) {
+            // 无主窗口时忽略
+        }
+    }
+
     // ------------------------------------------------------------------ 隐身
 
     public void panic() {
+        stopAuto();
         FileEditorManager fem = FileEditorManager.getInstance(project);
         if (viewFile != null && viewFile.isValid()) {
             fem.closeFile(viewFile);

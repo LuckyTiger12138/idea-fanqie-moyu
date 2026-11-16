@@ -25,6 +25,8 @@ import org.jetbrains.annotations.NotNull;
 import javax.swing.BorderFactory;
 import javax.swing.BoxLayout;
 import javax.swing.JButton;
+import javax.swing.JCheckBox;
+import javax.swing.JComboBox;
 import javax.swing.JComponent;
 import javax.swing.JFileChooser;
 import javax.swing.JLabel;
@@ -122,6 +124,12 @@ public final class LibraryWindow implements ToolWindowFactory {
         private final JButton jumpBtn = new JButton("跳转");
         private final JBTextField jumpField = new JBTextField();
         private final JLabel progressLabel = new JLabel("未打开");
+        private final JCheckBox autoBox = new JCheckBox("自动");
+        private final JComboBox<String> speedBox = new JComboBox<>(
+                new String[]{"0.8 秒/行", "1.2 秒/行", "1.8 秒/行", "2.5 秒/行", "4 秒/行"});
+        private static final int[] SPEEDS = {800, 1200, 1800, 2500, 4000};
+        /** 面板回填状态时置位，避免 setSelected 反过来触发 toggle */
+        private boolean syncing;
         private final AtomicBoolean busy = new AtomicBoolean(false);
 
         private final List<FanqieApi.Book> results = new ArrayList<>();
@@ -175,7 +183,27 @@ public final class LibraryWindow implements ToolWindowFactory {
             nextBtn.addActionListener(e -> ReaderService.getInstance(project).next());
             jumpBtn.addActionListener(e -> doJump());
             jumpField.addActionListener(e -> doJump());
-            ReaderService.getInstance(project).setProgressListener(this::updateProgress);
+            autoBox.addActionListener(e -> {
+                if (syncing) {
+                    return;
+                }
+                ReaderService.getInstance(project).toggleAuto();
+            });
+            speedBox.addActionListener(e -> {
+                if (syncing) {
+                    return;
+                }
+                int at = Math.max(0, Math.min(speedBox.getSelectedIndex(), SPEEDS.length - 1));
+                ReaderSettings.get().autoIntervalMs = SPEEDS[at];
+                setStatus("滚动速度：" + speedBox.getSelectedItem());
+            });
+            ReaderService svc = ReaderService.getInstance(project);
+            svc.setProgressListener(this::updateProgress);
+            svc.setAutoListener(this::syncAutoState);
+            ReaderSettings s0 = ReaderSettings.get();
+            syncing = true;
+            speedBox.setSelectedIndex(nearestSpeed(s0.autoIntervalMs));
+            syncing = false;
             resultTable.addMouseListener(new MouseAdapter() {
                 @Override
                 public void mouseClicked(MouseEvent e) {
@@ -240,20 +268,31 @@ public final class LibraryWindow implements ToolWindowFactory {
 
         /** 底部导航条：不依赖快捷键也能翻节、跳节，并显示当前进度 */
         private JComponent buildNavBar() {
-            JPanel bar = new JPanel(new FlowLayout(FlowLayout.LEFT, 6, 4));
+            JPanel bar = new JPanel();
+            bar.setLayout(new BoxLayout(bar, BoxLayout.Y_AXIS));
             bar.setBorder(BorderFactory.createMatteBorder(1, 0, 0, 0, JBColor.border()));
 
+            JPanel row1 = new JPanel(new FlowLayout(FlowLayout.LEFT, 6, 4));
             prevBtn.setToolTipText("上一节（快捷键 Ctrl+Alt+Shift+Z）");
             nextBtn.setToolTipText("下一节（快捷键 Ctrl+Alt+Shift+C）");
             jumpField.setPreferredSize(new Dimension(64, 26));
             jumpField.getEmptyText().setText("节号");
             jumpField.setToolTipText("填节号后回车直接跳过去");
+            row1.add(prevBtn);
+            row1.add(nextBtn);
+            row1.add(jumpField);
+            row1.add(jumpBtn);
+            row1.add(progressLabel);
 
-            bar.add(prevBtn);
-            bar.add(nextBtn);
-            bar.add(jumpField);
-            bar.add(jumpBtn);
-            bar.add(progressLabel);
+            JPanel row2 = new JPanel(new FlowLayout(FlowLayout.LEFT, 6, 0));
+            autoBox.setToolTipText("自动向下滚动，读完一节自动接下一节（快捷键 Ctrl+Alt+Shift+A）");
+            speedBox.setToolTipText("每行停留多久，越大越慢");
+            row2.add(autoBox);
+            row2.add(speedBox);
+            row2.setBorder(BorderFactory.createEmptyBorder(0, 0, 4, 0));
+
+            bar.add(row1);
+            bar.add(row2);
             return bar;
         }
 
@@ -299,6 +338,25 @@ public final class LibraryWindow implements ToolWindowFactory {
             prevBtn.setEnabled(pos > 1);
             nextBtn.setEnabled(pos < total);
             jumpBtn.setEnabled(true);
+        }
+
+        /** 自动阅读开关由快捷键或面板改动后，回填面板状态 */
+        private void syncAutoState() {
+            boolean on = ReaderService.getInstance(project).isAutoReading();
+            syncing = true;
+            autoBox.setSelected(on);
+            autoBox.setText(on ? "自动中" : "自动");
+            syncing = false;
+        }
+
+        private static int nearestSpeed(int ms) {
+            int best = 0;
+            for (int i = 0; i < SPEEDS.length; i++) {
+                if (Math.abs(SPEEDS[i] - ms) < Math.abs(SPEEDS[best] - ms)) {
+                    best = i;
+                }
+            }
+            return best;
         }
 
         // ------------------------------------------------------------ 导入
@@ -628,7 +686,9 @@ public final class LibraryWindow implements ToolWindowFactory {
         @Override
         public void dispose() {
             try {
-                ReaderService.getInstance(project).setProgressListener(null);
+                ReaderService svc = ReaderService.getInstance(project);
+                svc.setProgressListener(null);
+                svc.setAutoListener(null);
             } catch (Throwable ignored) {
                 // 项目已释放时忽略
             }
