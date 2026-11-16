@@ -43,6 +43,7 @@ public class SettingsConfigurable implements Configurable {
     private JTextField autoMsField;
     private JTextField autoLinesField;
     private JCheckBox chainBox;
+    private JTextField chainTailField;
     private JButton testBtn;
     private JPanel panel;
 
@@ -67,6 +68,8 @@ public class SettingsConfigurable implements Configurable {
         autoLinesField = new JTextField();
         autoLinesField.setPreferredSize(new Dimension(80, autoLinesField.getPreferredSize().height));
         chainBox = new JCheckBox("滚到本节末尾后自动接下一节");
+        chainTailField = new JTextField();
+        chainTailField.setPreferredSize(new Dimension(80, chainTailField.getPreferredSize().height));
         testBtn = new JButton("测试连接");
         testBtn.addActionListener(e -> testConnection());
 
@@ -101,6 +104,9 @@ public class SettingsConfigurable implements Configurable {
         body.add(row("自动间隔(ms)", autoMsField, "自动阅读时每行停留多久，1200 约等于一秒二滚一行"));
         body.add(row("每次行数", autoLinesField, "每次向下滚几行，建议 1 到 3"));
         body.add(row("滚到底接续", chainBox, "手动用滚轮翻到本节最后一行后，再往下滚一格就自动进入下一节"));
+        body.add(row("换节位置(%)", chainTailField,
+                "最后一行滚到屏幕从上往下这个高度，再往下滚才换下一节。35 表示可以一路滚到屏幕偏上、视线停在中间；"
+                        + "90 表示刚离开屏幕底部就换"));
         body.add(hint("自动阅读用 Ctrl+Alt+Shift+A 开关（也可用面板底部的「自动」勾选框）。"
                 + "开启后编辑器自己往下滚，读完一节自动接下一节，不需要点任何按钮；"
                 + "当前台标签不是笔记文件时它会自动停住，不会滚动你正在看的其他代码。"));
@@ -202,6 +208,9 @@ public class SettingsConfigurable implements Configurable {
         if (chainBox != null && chainBox.isSelected() != s.chainOnScroll) {
             return true;
         }
+        if (chainTailField != null && parseInt(chainTailField.getText(), 35) != s.chainTailPercent) {
+            return true;
+        }
         return autoLinesField != null && parseInt(autoLinesField.getText(), 1) != s.autoLines;
     }
 
@@ -241,6 +250,9 @@ public class SettingsConfigurable implements Configurable {
         if (chainBox != null) {
             s.chainOnScroll = chainBox.isSelected();
         }
+        if (chainTailField != null) {
+            s.chainTailPercent = Math.max(10, Math.min(90, parseInt(chainTailField.getText(), 35)));
+        }
     }
 
     @Override
@@ -273,6 +285,9 @@ public class SettingsConfigurable implements Configurable {
         if (chainBox != null) {
             chainBox.setSelected(s.chainOnScroll);
         }
+        if (chainTailField != null) {
+            chainTailField.setText(String.valueOf(s.chainTailPercent));
+        }
     }
 
     @Override
@@ -287,6 +302,7 @@ public class SettingsConfigurable implements Configurable {
         autoMsField = null;
         autoLinesField = null;
         chainBox = null;
+        chainTailField = null;
         testBtn = null;
     }
 

@@ -56,6 +56,13 @@ public class ReaderSettings implements PersistentStateComponent<ReaderSettings> 
     /** 手动滚到本节末尾时，是否自动接下一节 */
     public boolean chainOnScroll = true;
 
+    /**
+     * 换节位置：最后一行滚到视口从上往下这个百分比处，再往下滚才换下一节。
+     * 35 表示最后一行可以一路滚到屏幕偏上的位置，视线落在屏幕中部；
+     * 90 表示最后一行刚离开屏幕底部就换。
+     */
+    public int chainTailPercent = 35;
+
     public static ReaderSettings get() {
         return ApplicationManager.getApplication().getService(ReaderSettings.class);
     }

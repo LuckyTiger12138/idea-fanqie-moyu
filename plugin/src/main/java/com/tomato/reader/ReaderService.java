@@ -738,7 +738,7 @@ public final class ReaderService implements Disposable {
         int bottom = Math.max(0, contentHeight - (vis == null ? 0 : vis.height));
         int cur = sm.getVerticalScrollOffset();
 
-        if (atEnd(editor)) {
+        if (lastLineVisible(editor)) {
             // 到末尾了：先把最后一屏读完，再换下一节
             int lines = editor.getDocument().getLineCount();
             int visible = vis == null ? 20 : Math.max(1, vis.height / lineH);
@@ -842,11 +842,9 @@ public final class ReaderService implements Disposable {
     }
 
     /**
-     * 最后一行是否已经滚进可视区。
-     * 用「最后一行文字的底部」而不是「内容总高度」来判断——IDEA 允许滚过最后一行，
-     * 按总高度算会永远差一屏，这正是之前滚到底没反应的原因之一。
+     * 最后一行是否已经滚进可视区（自动阅读换节用：读完最后一屏就换，不浪费空白页）。
      */
-    private boolean atEnd(Editor editor) {
+    private boolean lastLineVisible(Editor editor) {
         Rectangle vis = editor.getScrollingModel().getVisibleArea();
         if (vis == null || vis.height <= 0) {
             return false;
@@ -855,6 +853,40 @@ public final class ReaderService implements Disposable {
         int lastY = editor.visualPositionToXY(editor.offsetToVisualPosition(len)).y;
         int lineH = Math.max(1, editor.getLineHeight());
         return vis.y + vis.height >= lastY + lineH / 2;
+    }
+
+    /**
+     * 最后一行是否已经滚到视口上方「翻页位置」以上（手动滚轮换节用）。
+     * 不按「内容总高度 - 视口高度」判断，而是看最后一行的实际屏幕位置：
+     * 这样最后几行可以一路滚到靠上的位置（默认屏幕 35% 处），读起来视线停在屏幕中部，
+     * 而不是刚看到最后一行就被翻走。
+     */
+    private boolean chainZoneReached(Editor editor) {
+        Rectangle vis = editor.getScrollingModel().getVisibleArea();
+        if (vis == null || vis.height <= 0) {
+            return false;
+        }
+        int len = editor.getDocument().getTextLength();
+        int lastY = editor.visualPositionToXY(editor.offsetToVisualPosition(len)).y;
+        int percent = Math.max(10, Math.min(90, ReaderSettings.get().chainTailPercent));
+        int limit = (int) (vis.height * (percent / 100.0));
+        // 滚过末尾时 lastY 会跑到视口上方（差值为负），同样算到达
+        return lastY - vis.y <= limit;
+    }
+
+    /**
+     * 是否已经滚到绝对底部（再滚也不会动）。
+     * 兜底用：如果用户在 IDEA 里关掉了「末行之后仍可滚动」，最后一行到不了视口上方，
+     * 只靠 chainZoneReached 就永远不触发，所以这里补一条「到底了还继续滚」也算。
+     */
+    private boolean atAbsoluteBottom(Editor editor) {
+        Rectangle vis = editor.getScrollingModel().getVisibleArea();
+        if (vis == null || vis.height <= 0) {
+            return false;
+        }
+        int content = editor.getContentComponent().getHeight();
+        int offset = editor.getScrollingModel().getVerticalScrollOffset();
+        return offset >= Math.max(0, content - vis.height) - 2;
     }
 
     /**
@@ -914,7 +946,7 @@ public final class ReaderService implements Disposable {
             return;
         }
         Editor editor = selectedReaderEditor();
-        if (editor == null || !atEnd(editor)) {
+        if (editor == null || (!chainZoneReached(editor) && !atAbsoluteBottom(editor))) {
             return;
         }
         long now = System.currentTimeMillis();
