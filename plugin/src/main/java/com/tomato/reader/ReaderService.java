@@ -32,6 +32,11 @@ import java.awt.Component;
 import java.awt.Rectangle;
 import java.awt.event.MouseWheelEvent;
 import java.awt.event.MouseWheelListener;
+import javax.swing.JScrollPane;
+import javax.swing.SwingUtilities;
+import java.awt.AWTEvent;
+import java.awt.Toolkit;
+import java.awt.event.AWTEventListener;
 
 import java.io.File;
 import java.io.IOException;
@@ -92,12 +97,17 @@ public final class ReaderService implements Disposable {
 
     /** 手动滚到末尾自动接下一节：滚轮监听挂在阅读视图的编辑区上 */
     private final MouseWheelListener wheelListener = this::onWheel;
+    private final List<Component> wheelTargets = new ArrayList<>();
     private Component wheelTarget;
     private long lastChainAt;
+    /** 全局 AWT 滚轮监听：编辑区可能把滚轮事件自己消化掉，这里兜一层保险 */
+    private final AWTEventListener awtWheel = this::onAwtWheel;
+    private boolean awtWheelInstalled;
 
     public ReaderService(Project project) {
         this.project = project;
         this.autoAlarm = new Alarm(Alarm.ThreadToUse.SWING_THREAD, this);
+        installAwtWheel();
         // 切回阅读文件时补挂滚轮监听（首次打开可能拿不到编辑器，这里兜底）
         project.getMessageBus().connect(this).subscribe(FileEditorManagerListener.FILE_EDITOR_MANAGER,
                 new FileEditorManagerListener() {
@@ -116,6 +126,7 @@ public final class ReaderService implements Disposable {
     @Override
     public void dispose() {
         autoRead = false;
+        removeAwtWheel();
         try {
             autoAlarm.cancelAllRequests();
             autoAlarm.dispose();
@@ -715,7 +726,7 @@ public final class ReaderService implements Disposable {
         int bottom = Math.max(0, contentHeight - (vis == null ? 0 : vis.height));
         int cur = sm.getVerticalScrollOffset();
 
-        if (cur >= bottom - 2) {
+        if (atEnd(editor)) {
             // 到末尾了：先把最后一屏读完，再换下一节
             int lines = editor.getDocument().getLineCount();
             int visible = vis == null ? 20 : Math.max(1, vis.height / lineH);
@@ -756,7 +767,10 @@ public final class ReaderService implements Disposable {
 
     // ------------------------------------------------------------ 滚到底自动接下一节
 
-    /** 把滚轮监听挂到阅读视图的编辑区上，只挂一次 */
+    /**
+     * 把滚轮监听挂到阅读视图上：编辑区和外层滚动面板各挂一份，
+     * 编辑区自己吃掉滚轮事件时外层那份还能收到，避免「滚了没反应」。
+     */
     private void installScrollHook() {
         if (!ReaderSettings.get().chainOnScroll) {
             return;
@@ -773,46 +787,131 @@ public final class ReaderService implements Disposable {
         if (c == wheelTarget) {
             return;
         }
-        if (wheelTarget != null) {
-            wheelTarget.removeMouseWheelListener(wheelListener);
+        for (Component old : wheelTargets) {
+            if (old != null) {
+                old.removeMouseWheelListener(wheelListener);
+            }
         }
+        wheelTargets.clear();
         c.addMouseWheelListener(wheelListener);
+        wheelTargets.add(c);
+        Component pane = SwingUtilities.getAncestorOfClass(JScrollPane.class, c);
+        if (pane != null) {
+            pane.addMouseWheelListener(wheelListener);
+            wheelTargets.add(pane);
+        }
         wheelTarget = c;
     }
 
+    /** 全局滚轮监听在服务创建时就装好，避免编辑器换过一次才生效 */
+    private void installAwtWheel() {
+        if (awtWheelInstalled) {
+            return;
+        }
+        try {
+            Toolkit.getDefaultToolkit().addAWTEventListener(awtWheel, MouseWheelEvent.MOUSE_WHEEL);
+            awtWheelInstalled = true;
+        } catch (Throwable ignored) {
+            // 无头环境或权限受限时跳过
+        }
+    }
+
+    private void removeAwtWheel() {
+        if (!awtWheelInstalled) {
+            return;
+        }
+        awtWheelInstalled = false;
+        try {
+            Toolkit.getDefaultToolkit().removeAWTEventListener(awtWheel);
+        } catch (Throwable ignored) {
+            // 已卸载
+        }
+    }
+
     /**
-     * 手动滚到底再往下滚一格 → 接下一节。
-     * 只在「已经贴到底、还继续往下滚」时触发，读最后一屏时不会被打断；
-     * 短到一屏放得下的节，滚一下就换，一次滚轮只换一节。
+     * 最后一行是否已经滚进可视区。
+     * 用「最后一行文字的底部」而不是「内容总高度」来判断——IDEA 允许滚过最后一行，
+     * 按总高度算会永远差一屏，这正是之前滚到底没反应的原因之一。
+     */
+    private boolean atEnd(Editor editor) {
+        Rectangle vis = editor.getScrollingModel().getVisibleArea();
+        if (vis == null) {
+            return false;
+        }
+        int len = editor.getDocument().getTextLength();
+        int lastY = editor.visualPositionToXY(editor.offsetToVisualPosition(len)).y;
+        int lineH = Math.max(1, editor.getLineHeight());
+        return vis.y + vis.height >= lastY + lineH / 2;
+    }
+
+    /**
+     * 手动滚到底再往下滚 → 接下一节。
+     * 只在「最后一行已经在屏幕上、还继续往下滚」时触发，读最后一屏不会被打断；
+     * 触摸板/平滑滚动会给精确值而 getWheelRotation() 为 0，所以两个都看。
      */
     private void onWheel(MouseWheelEvent e) {
-        if (e == null || e.getWheelRotation() <= 0 || !ReaderSettings.get().chainOnScroll) {
+        chainIfAtEnd(e);
+    }
+
+    /** 全局兜底：编辑区把滚轮事件消化掉时，AWT 这一层还能看到 */
+    private void onAwtWheel(AWTEvent event) {
+        if (!(event instanceof MouseWheelEvent)) {
             return;
         }
-        if (entries.isEmpty() || viewFile == null || !bodyReady) {
-            return;
-        }
-        Editor editor = FileEditorManager.getInstance(project).getSelectedTextEditor();
+        MouseWheelEvent e = (MouseWheelEvent) event;
+        Editor editor = selectedReaderEditor();
         if (editor == null) {
             return;
         }
-        VirtualFile shown = FileDocumentManager.getInstance().getFile(editor.getDocument());
-        if (shown == null || !shown.getPath().equals(viewFile.getPath())) {
+        Component src = e.getComponent();
+        Component content = editor.getContentComponent();
+        if (src == null || content == null) {
             return;
         }
-        ScrollingModel sm = editor.getScrollingModel();
-        Rectangle vis = sm.getVisibleArea();
-        int contentHeight = editor.getContentComponent().getHeight();
-        int bottom = Math.max(0, contentHeight - (vis == null ? 0 : vis.height));
-        if (sm.getVerticalScrollOffset() < bottom - 1) {
+        // 只认落在阅读编辑区（或它外层滚动条/滚动面板）上的滚轮
+        if (src != content && !SwingUtilities.isDescendingFrom(src, content)
+                && !SwingUtilities.isDescendingFrom(content, src)) {
+            return;
+        }
+        chainIfAtEnd(e);
+    }
+
+    /** 当前选中的编辑器是否就是阅读视图 */
+    @Nullable
+    private Editor selectedReaderEditor() {
+        Editor editor = FileEditorManager.getInstance(project).getSelectedTextEditor();
+        if (editor == null || viewFile == null) {
+            return null;
+        }
+        VirtualFile shown = FileDocumentManager.getInstance().getFile(editor.getDocument());
+        if (shown == null || !shown.getPath().equals(viewFile.getPath())) {
+            return null;
+        }
+        return editor;
+    }
+
+    private void chainIfAtEnd(MouseWheelEvent e) {
+        if (e == null || !ReaderSettings.get().chainOnScroll) {
+            return;
+        }
+        if (e.getPreciseWheelRotation() <= 0 && e.getWheelRotation() <= 0) {
+            return;
+        }
+        if (entries.isEmpty() || !bodyReady) {
+            return;
+        }
+        Editor editor = selectedReaderEditor();
+        if (editor == null || !atEnd(editor)) {
             return;
         }
         long now = System.currentTimeMillis();
-        if (now - lastChainAt < 600) {
+        if (now - lastChainAt < 500) {
             return;
         }
         lastChainAt = now;
-        advanceChapter();
+        if (advanceChapter()) {
+            hint("WorkNotes · " + (index + 1) + "/" + entries.size());
+        }
     }
 
     /** 换节后回到顶部，接着往下读 */
