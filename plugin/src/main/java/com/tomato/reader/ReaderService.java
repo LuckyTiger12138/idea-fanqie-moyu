@@ -8,6 +8,8 @@ import com.intellij.openapi.editor.Editor;
 import com.intellij.openapi.editor.ScrollingModel;
 import com.intellij.openapi.fileEditor.FileDocumentManager;
 import com.intellij.openapi.fileEditor.FileEditorManager;
+import com.intellij.openapi.fileEditor.FileEditorManagerEvent;
+import com.intellij.openapi.fileEditor.FileEditorManagerListener;
 import com.intellij.openapi.fileEditor.OpenFileDescriptor;
 import com.intellij.openapi.project.Project;
 import com.intellij.openapi.ui.Messages;
@@ -23,6 +25,7 @@ import com.tomato.reader.source.OnlineSource;
 import com.tomato.reader.ui.SearchDialog;
 import com.intellij.util.Alarm;
 import com.intellij.util.concurrency.AppExecutorUtil;
+import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
 
 import java.awt.Component;
@@ -95,6 +98,19 @@ public final class ReaderService implements Disposable {
     public ReaderService(Project project) {
         this.project = project;
         this.autoAlarm = new Alarm(Alarm.ThreadToUse.SWING_THREAD, this);
+        // 切回阅读文件时补挂滚轮监听（首次打开可能拿不到编辑器，这里兜底）
+        project.getMessageBus().connect(this).subscribe(FileEditorManagerListener.FILE_EDITOR_MANAGER,
+                new FileEditorManagerListener() {
+                    @Override
+                    public void selectionChanged(@NotNull FileEditorManagerEvent event) {
+                        installScrollHook();
+                    }
+
+                    @Override
+                    public void fileOpened(@NotNull FileEditorManager source, @NotNull VirtualFile file) {
+                        installScrollHook();
+                    }
+                });
     }
 
     @Override
@@ -527,6 +543,7 @@ public final class ReaderService implements Disposable {
         fem.openTextEditor(new OpenFileDescriptor(project, vf, 0), !autoRead);
         s.chapterIndex = index;
         installScrollHook();
+        ApplicationManager.getApplication().invokeLater(this::installScrollHook);
         notifyProgress();
     }
 
