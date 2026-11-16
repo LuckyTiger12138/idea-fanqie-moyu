@@ -554,7 +554,12 @@ public final class ReaderService implements Disposable {
         fem.openTextEditor(new OpenFileDescriptor(project, vf, 0), !autoRead);
         s.chapterIndex = index;
         installScrollHook();
-        ApplicationManager.getApplication().invokeLater(this::installScrollHook);
+        // 每节都从顶部开始：不抢焦点地打开编辑器时，IDE 可能保留上一次的滚动位置，
+        // 那会让新一节一打开就贴在最底部（滚轮往下自然没反应）
+        ApplicationManager.getApplication().invokeLater(() -> {
+            installScrollHook();
+            scrollViewToTop();
+        });
         notifyProgress();
     }
 
