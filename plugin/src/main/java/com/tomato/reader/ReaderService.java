@@ -559,6 +559,8 @@ public final class ReaderService implements Disposable {
         ApplicationManager.getApplication().invokeLater(() -> {
             installScrollHook();
             scrollViewToTop();
+            // 布局还没稳定时第一次滚不动，再补一次
+            ApplicationManager.getApplication().invokeLater(this::scrollViewToTop);
         });
         notifyProgress();
     }
